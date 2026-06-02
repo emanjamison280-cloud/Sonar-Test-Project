@@ -3,6 +3,10 @@
 import cv2
 import time
 import sys
+import os
+
+# Add parent directory to path to import config
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from camera_handler import CameraHandler
 from sonar_detector import SonarDetector
