@@ -1,11 +1,12 @@
-"""Sonar wave visualization module - Radar-style display"""
+"""Updated wave visualizer with audio sonar detection support"""
 
 import cv2
 import numpy as np
 import math
 from config.config import (
     CAMERA_WIDTH, CAMERA_HEIGHT, RADAR_RADIUS, WAVE_COLOR,
-    DETECTION_COLOR, BACKGROUND_COLOR, WAVE_SPEED, WAVE_THICKNESS, MAX_DISTANCE
+    DETECTION_COLOR, BACKGROUND_COLOR, WAVE_SPEED, WAVE_THICKNESS, MAX_DISTANCE,
+    AUDIO_DETECTION_COLOR
 )
 
 
@@ -19,6 +20,7 @@ class WaveVisualizer:
         self.radar_radius = RADAR_RADIUS
         self.active_waves = []  # List of expanding waves
         self.frame_count = 0
+        self.audio_detections = []  # Store audio sonar detections
         
     def add_wave(self, distance):
         """
@@ -39,6 +41,34 @@ class WaveVisualizer:
         }
         self.active_waves.append(wave)
     
+    def add_audio_detection(self, distance, angle, confidence):
+        """
+        Add audio sonar detection
+        
+        Args:
+            distance: Distance in meters
+            angle: Angle in degrees (0-360)
+            confidence: Confidence level (0-1)
+        """
+        # Convert distance to pixel radius
+        pixel_distance = (distance / MAX_DISTANCE) * self.radar_radius
+        
+        # Convert angle to radians and calculate x, y
+        angle_rad = math.radians(angle)
+        x = self.center[0] + pixel_distance * math.cos(angle_rad)
+        y = self.center[1] + pixel_distance * math.sin(angle_rad)
+        
+        detection = {
+            'x': x,
+            'y': y,
+            'distance': distance,
+            'angle': angle,
+            'confidence': confidence,
+            'age': 0,
+            'max_age': 30  # Show for 30 frames
+        }
+        self.audio_detections.append(detection)
+    
     def update_waves(self):
         """Update wave animations"""
         for wave in self.active_waves:
@@ -48,6 +78,12 @@ class WaveVisualizer:
         
         # Remove old waves
         self.active_waves = [w for w in self.active_waves if w['age'] < w['max_age']]
+        
+        # Update audio detections
+        for detection in self.audio_detections:
+            detection['age'] += 1
+        
+        self.audio_detections = [d for d in self.audio_detections if d['age'] < d['max_age']]
     
     def draw_radar_background(self, frame):
         """
@@ -62,7 +98,7 @@ class WaveVisualizer:
             radius = i * circle_spacing
             cv2.circle(frame, self.center, radius, (100, 100, 100), 1)
         
-        # Draw crosshairs
+        # Draw crosshairs (N, S, E, W)
         cv2.line(frame, (self.center[0] - 20, self.center[1]), 
                  (self.center[0] + 20, self.center[1]), (100, 100, 100), 1)
         cv2.line(frame, (self.center[0], self.center[1] - 20), 
@@ -77,6 +113,16 @@ class WaveVisualizer:
             y = self.center[1] - (i * circle_spacing)
             cv2.putText(frame, dist_label, (self.center[0] + 10, y),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+        
+        # Add direction labels
+        cv2.putText(frame, "N", (self.center[0] - 5, self.center[1] - self.radar_radius - 10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+        cv2.putText(frame, "S", (self.center[0] - 5, self.center[1] + self.radar_radius + 20),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+        cv2.putText(frame, "E", (self.center[0] + self.radar_radius + 5, self.center[1] + 5),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+        cv2.putText(frame, "W", (self.center[0] - self.radar_radius - 15, self.center[1] + 5),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
     
     def draw_waves(self, frame, detected_distances):
         """
@@ -117,7 +163,39 @@ class WaveVisualizer:
             size = int(5 * confidence)
             cv2.circle(frame, (int(x), int(y)), size, DETECTION_COLOR, -1)
     
-    def draw_info(self, frame, fps=0, avg_distance=None):
+    def draw_audio_detections(self, frame):
+        """
+        Draw audio sonar detections on radar
+        
+        Args:
+            frame: Frame to draw on
+        """
+        for detection in self.audio_detections:
+            x = int(detection['x'])
+            y = int(detection['y'])
+            confidence = detection['confidence']
+            distance = detection['distance']
+            angle = detection['angle']
+            
+            # Size based on confidence
+            size = int(8 * confidence)
+            
+            # Fade out as age increases
+            fade_factor = 1.0 - (detection['age'] / detection['max_age'])
+            color_faded = tuple(int(c * fade_factor) for c in AUDIO_DETECTION_COLOR)
+            
+            # Draw point
+            cv2.circle(frame, (x, y), size, color_faded, -1)
+            
+            # Draw line from center to detection
+            cv2.line(frame, self.center, (x, y), color_faded, 1)
+            
+            # Draw info label
+            info = f"{distance:.2f}m"
+            cv2.putText(frame, info, (x + 10, y - 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.3, color_faded, 1)
+    
+    def draw_info(self, frame, fps=0, avg_distance=None, audio_detection_count=0):
         """
         Draw information overlay
         
@@ -125,6 +203,7 @@ class WaveVisualizer:
             frame: Frame to draw on
             fps: Frames per second
             avg_distance: Average detected distance
+            audio_detection_count: Number of active audio detections
         """
         y_offset = 30
         cv2.putText(frame, f"FPS: {fps:.1f}", (10, y_offset),
@@ -136,6 +215,9 @@ class WaveVisualizer:
         
         cv2.putText(frame, f"Waves: {len(self.active_waves)}", (10, y_offset + 60),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        
+        cv2.putText(frame, f"Audio Detections: {audio_detection_count}", (10, y_offset + 90),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, AUDIO_DETECTION_COLOR, 2)
     
     def create_display(self, camera_frame, detected_distances, fps=0, avg_distance=None):
         """
@@ -158,8 +240,11 @@ class WaveVisualizer:
         # Draw waves and detections
         self.draw_waves(display_frame, detected_distances)
         
+        # Draw audio sonar detections
+        self.draw_audio_detections(display_frame)
+        
         # Draw info
-        self.draw_info(display_frame, fps, avg_distance)
+        self.draw_info(display_frame, fps, avg_distance, len(self.audio_detections))
         
         self.frame_count += 1
         
