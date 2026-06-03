@@ -35,4 +35,4 @@ CONFIDENCE_THRESHOLD = 0.6
 
 # Detection mode
 USE_AUDIO_SONAR = True  # Enable audio-based sonar
-USE_CAMERA_SONAR = False  # Enable camera-based sonar
+USE_CAMERA_SONAR = True  # Enable camera-based sonar
