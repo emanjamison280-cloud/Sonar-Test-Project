@@ -14,6 +14,7 @@ class SonarDetector:
         self.prev_frame = None
         self.detected_distances = []
         self.wave_history = []
+        self.frame_count = 0
         
     def estimate_distance(self, frame):
         """
@@ -27,43 +28,48 @@ class SonarDetector:
             distance: Estimated distance in meters (0-6 feet)
             confidence: Confidence level of detection (0-1)
         """
+        self.frame_count += 1
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # Edge detection
-        edges = cv2.Canny(gray, 50, 150)
+        # Blur to reduce noise
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         
-        # Find contours
-        contours, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        # Edge detection with more sensitive thresholds
+        edges = cv2.Canny(blurred, 30, 100)
         
-        if not contours:
-            return None, 0.0
+        # Dilate edges to connect nearby edges
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        edges = cv2.dilate(edges, kernel, iterations=2)
         
-        # Calculate average edge density as proxy for distance
+        # Calculate edge density as proxy for distance
         edge_density = np.sum(edges > 0) / edges.size
         
-        # Motion detection
+        # Motion detection - compare with previous frame
+        motion_score = 0.0
         if self.prev_frame is not None:
-            diff = cv2.absdiff(gray, self.prev_frame)
-            motion = np.sum(diff > 30) / diff.size
-        else:
-            motion = 0.0
+            diff = cv2.absdiff(blurred, self.prev_frame)
+            # More sensitive motion threshold
+            motion = np.sum(diff > 15) / diff.size
+            motion_score = motion
         
-        self.prev_frame = gray.copy()
+        self.prev_frame = blurred.copy()
         
-        # Combine metrics for distance estimation
-        # Higher edge density and motion = closer object
-        combined_score = (edge_density * 0.6 + motion * 0.4)
+        # Combined score: favor motion detection
+        # If there's movement, it's a strong detection
+        combined_score = (edge_density * 0.3 + motion_score * 0.7)
         
-        # Map score to distance range (0-6 feet = 0-1.83 meters)
-        if combined_score < 0.05:
+        # Lower threshold for detection
+        if combined_score < 0.02:
             return None, 0.0
         
-        distance = MAX_DISTANCE - (combined_score * MAX_DISTANCE)
+        # Map score to distance range
+        # Higher score = more motion/edges = object is closer
+        distance = MAX_DISTANCE * (1.0 - np.clip(combined_score, 0, 1.0))
         distance = np.clip(distance, MIN_DISTANCE, MAX_DISTANCE)
         confidence = np.clip(combined_score, 0.0, 1.0)
         
-        # Apply confidence threshold
-        if confidence < CONFIDENCE_THRESHOLD:
+        # Lower confidence threshold for better detection
+        if confidence < 0.05:
             return None, confidence
         
         return distance, confidence
