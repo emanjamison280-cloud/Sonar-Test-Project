@@ -77,12 +77,19 @@ class AudioSonarDetector:
         if duration is None:
             duration = self.chirp_duration
             
-        t = np.linspace(0, duration, int(self.sample_rate * duration))
+        num_samples = int(self.sample_rate * duration)
+        t = np.linspace(0, duration, num_samples)
+        
         # Linear frequency sweep
         chirp = np.sin(2 * np.pi * (start_freq * t + (end_freq - start_freq) * t**2 / (2 * duration)))
-        # Apply envelope to avoid clicks
-        envelope = np.hann(len(chirp))
-        return (chirp * envelope * 0.3).astype(np.float32)  # Reduce volume for safety
+        
+        # Apply simple envelope (fade in/out)
+        envelope = np.ones(len(chirp))
+        fade_samples = int(num_samples * 0.1)
+        envelope[:fade_samples] = np.linspace(0, 1, fade_samples)
+        envelope[-fade_samples:] = np.linspace(1, 0, fade_samples)
+        
+        return (chirp * envelope * 0.3).astype(np.float32)
     
     def emit_chirp(self):
         """Emit a chirp signal"""
@@ -100,7 +107,7 @@ class AudioSonarDetector:
         Listen for echoes and detect distances
         
         Returns:
-            detections: List of (distance, angle, confidence) tuples
+            detections: List of detection dicts
         """
         if self.stream_input is None:
             return []
@@ -112,10 +119,12 @@ class AudioSonarDetector:
             # Record audio during listen window
             frames = []
             for _ in range(listen_samples // self.chunk_size + 1):
-                data = self.stream_input.read(self.chunk_size, exception_on_overflow=False)
-                audio_data = np.frombuffer(data, dtype=np.float32)
-                frames.append(audio_data)
-                self.audio_buffer.extend(audio_data)
+                try:
+                    data = self.stream_input.read(self.chunk_size, exception_on_overflow=False)
+                    audio_data = np.frombuffer(data, dtype=np.float32)
+                    frames.append(audio_data)
+                except:
+                    continue
             
             if frames:
                 recorded = np.concatenate(frames)
@@ -133,91 +142,41 @@ class AudioSonarDetector:
             audio_data: Recorded audio samples
             
         Returns:
-            detections: List of (distance, angle, confidence) tuples
+            detections: List of detection dicts
         """
         detections = []
         
-        # Apply high-pass filter to focus on chirp frequency
-        filtered = self._bandpass_filter(audio_data, 8000, 22000)
-        
-        # Compute spectrogram to find chirp returns
-        # Look for energy spikes at chirp frequency
-        fft = np.abs(np.fft.fft(filtered))
-        freqs = np.fft.fftfreq(len(fft), 1/self.sample_rate)
-        
-        # Find peaks in the chirp frequency range
-        chirp_range = np.where((freqs > 10000) & (freqs < 20000))[0]
-        if len(chirp_range) > 0:
-            peak_idx = chirp_range[np.argmax(fft[chirp_range])]
-            peak_energy = fft[peak_idx]
+        try:
+            # Simple energy detection
+            energy = np.sum(np.abs(audio_data))
             
-            # Detect echo peaks using correlation
-            echo_distances = self._detect_echo_delays(filtered)
+            if energy < 0.01:  # No significant audio
+                return detections
             
-            for delay in echo_distances:
-                if delay > 0:  # Valid echo
-                    # Convert time delay to distance
-                    distance = (delay * SOLIC_SPEED) / 2  # Divide by 2 for round trip
-                    distance = np.clip(distance, MIN_DISTANCE, MAX_DISTANCE)
-                    
-                    # Estimate confidence based on energy
-                    confidence = min(1.0, peak_energy / np.max(fft) if np.max(fft) > 0 else 0)
-                    
-                    # Random angle for now (can be improved with multi-mic array)
-                    angle = np.random.uniform(0, 360)
-                    
-                    detections.append({
-                        'distance': distance,
-                        'angle': angle,
-                        'confidence': confidence
-                    })
+            # Detect peaks in the signal
+            rms = np.sqrt(np.mean(audio_data**2))
+            
+            if rms > 0.05:  # Detect significant signal
+                # Calculate a rough distance estimate based on signal strength
+                # Stronger signal = closer object
+                distance = MAX_DISTANCE * (1.0 - min(1.0, rms / 0.3))
+                distance = max(MIN_DISTANCE, distance)
+                
+                confidence = min(1.0, rms / 0.3)
+                
+                # Random angle (can be improved with multiple mics)
+                angle = np.random.uniform(0, 360)
+                
+                detections.append({
+                    'distance': distance,
+                    'angle': angle,
+                    'confidence': confidence
+                })
+        
+        except Exception as e:
+            print(f"Error analyzing echo: {e}")
         
         return detections
-    
-    def _bandpass_filter(self, signal, low_freq, high_freq):
-        """Apply bandpass filter to audio signal"""
-        fft = np.fft.fft(signal)
-        freqs = np.fft.fftfreq(len(fft), 1/self.sample_rate)
-        
-        # Create bandpass mask
-        mask = (np.abs(freqs) > low_freq) & (np.abs(freqs) < high_freq)
-        fft_filtered = fft.copy()
-        fft_filtered[~mask] = 0
-        
-        return np.real(np.fft.ifft(fft_filtered))
-    
-    def _detect_echo_delays(self, signal):
-        """
-        Detect echo delays by finding peaks in correlation
-        
-        Returns:
-            delays: List of time delays (in seconds) for detected echoes
-        """
-        delays = []
-        
-        # Cross-correlate signal with itself to find repeating patterns (echoes)
-        reference = signal[:int(self.sample_rate * self.chirp_duration)]
-        if len(reference) < 100:
-            return delays
-        
-        correlation = np.correlate(signal, reference, mode='same')
-        
-        # Normalize
-        correlation = correlation / np.max(np.abs(correlation)) if np.max(np.abs(correlation)) > 0 else correlation
-        
-        # Find peaks (echoes) with threshold
-        threshold = 0.3
-        peaks = np.where(correlation > threshold)[0]
-        
-        # Convert peak indices to time delays
-        for peak in peaks:
-            if abs(peak - len(signal)//2) > int(self.sample_rate * 0.01):  # Skip center (original signal)
-                delay_samples = abs(peak - len(signal)//2)
-                delay_time = delay_samples / self.sample_rate
-                delays.append(delay_time)
-        
-        # Keep only unique delays (remove duplicates)
-        return list(set([round(d, 4) for d in delays]))
     
     def get_detections(self):
         """Get current detections"""
@@ -236,7 +195,7 @@ class AudioSonarDetector:
             try:
                 # Emit chirp
                 self.emit_chirp()
-                time.sleep(0.05)  # Small delay after chirp
+                time.sleep(0.05)
                 
                 # Listen for echo
                 detections = self.listen_for_echo()
@@ -246,7 +205,7 @@ class AudioSonarDetector:
                     self.add_detection(detection)
                 
                 # Wait before next chirp
-                time.sleep(0.2)
+                time.sleep(0.3)
             except Exception as e:
                 print(f"Error in detection loop: {e}")
     
@@ -259,11 +218,14 @@ class AudioSonarDetector:
     def stop(self):
         """Stop detection and cleanup"""
         self.is_listening = False
-        if self.stream_input:
-            self.stream_input.stop_stream()
-            self.stream_input.close()
-        if self.stream_output:
-            self.stream_output.stop_stream()
-            self.stream_output.close()
-        self.p.terminate()
+        try:
+            if self.stream_input:
+                self.stream_input.stop_stream()
+                self.stream_input.close()
+            if self.stream_output:
+                self.stream_output.stop_stream()
+                self.stream_output.close()
+            self.p.terminate()
+        except:
+            pass
         print("Audio sonar stopped")
